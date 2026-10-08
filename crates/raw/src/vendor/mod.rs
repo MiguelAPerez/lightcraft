@@ -7,6 +7,7 @@ pub mod nefc;
 pub mod orf;
 pub mod pef;
 pub mod raf;
+pub mod rafc;
 pub mod rw2;
 
 use crate::{BlackLevel, Rect};

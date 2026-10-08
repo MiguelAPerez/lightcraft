@@ -1,4 +1,4 @@
-//! Fujifilm RAF — uncompressed Bayer and X-Trans.
+//! Fujifilm RAF — uncompressed and lossless compressed, Bayer and X-Trans.
 //!
 //! Sources: the ExifTool FujiFilm tag-name documentation (RAF header record tags `0x0100` RawImageFullSize,
 //! `0x0110` RawImageCropTopLeft, `0x0111` RawImageCroppedSize, `0x0131` XTransLayout; raw-IFD tags `0xf001`
@@ -17,9 +17,11 @@
 //!   is anchored at raw pixel (0, 0) — verified on X-Trans I and III samples by minimising the difference
 //!   between horizontally / vertically adjacent "green" samples over all 72 orientations/phases, and by colour
 //!   renders. Bayer bodies (X-A series) use RGGB at (0, 0), verified by colour renders.
-//! - Fujifilm's compressed RAF variants are reported as unsupported (their embedded preview still works).
+//! - A strip too short for uncompressed samples that starts with the `IS` signature is compressed: lossless compressed
+//!   strips are decoded by `rafc.rs` (see its provenance note), lossy ones are reported as unsupported (their embedded
+//!   preview still works).
 
-use super::white_from_data;
+use super::{rafc, white_from_data};
 use crate::unpack::{unpack_lsb, unpack_msb};
 use crate::{BlackLevel, Cfa, ColorData, Mode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
 use lightcraft_geom::Orientation;
@@ -133,20 +135,41 @@ pub(crate) fn decode(bytes: &[u8], mode: Mode) -> Result<RawImage> {
         0 => packed_row,
         words => (words * 4).max(packed_row),
     };
-    if (len as u64) < (stride as u64) * (hgt as u64 - 1) + packed_row as u64 {
-        return Err(RawError::Unsupported(format!("Fujifilm compressed RAF ({len} bytes for {w}x{hgt} {bits}-bit)")));
-    }
     let src = raw.get(off..off.saturating_add(len).min(raw.len())).ok_or_else(|| RawError::Corrupt("RAF strip outside file".into()))?;
-    let mut data = Vec::new();
-    if mode == Mode::Full {
-        data = vec![0u16; n];
-        data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            let s = src.get(y * stride..(y * stride + packed_row).min(src.len())).unwrap_or(&[]);
-            unpack_row(s, store, row);
-        });
-    }
-
     let cfa = cfa(&h);
+    let mut data = Vec::new();
+    let compressed = (len as u64) < (stride as u64) * (hgt as u64 - 1) + packed_row as u64;
+    let bits = if compressed {
+        if !rafc::Header::signature(src) {
+            return Err(RawError::Unsupported(format!("Fujifilm compressed RAF ({len} bytes for {w}x{hgt} {bits}-bit)")));
+        }
+        // A compressed strip this decoder can't read opens from its embedded preview, as before it existed.
+        let fallback = |e: RawError| match e {
+            RawError::Corrupt(why) => RawError::Unsupported(format!("Fujifilm compressed RAF that does not decode ({why})")),
+            e => e,
+        };
+        let header = rafc::Header::parse(src).map_err(fallback)?;
+        if (header.width, header.height) != (w, hgt) {
+            return Err(fallback(RawError::Corrupt(format!("header {}x{}, raw IFD {w}x{hgt}", header.width, header.height))));
+        }
+        if !header.lossless {
+            return Err(RawError::Unsupported("Fujifilm lossy compressed RAF".into()));
+        }
+        header.blocks(src).map_err(fallback)?;
+        if mode == Mode::Full {
+            data = rafc::decode(src, &header, &cfa).map_err(fallback)?;
+        }
+        header.bits
+    } else {
+        if mode == Mode::Full {
+            data = vec![0u16; n];
+            data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+                let s = src.get(y * stride..(y * stride + packed_row).min(src.len())).unwrap_or(&[]);
+                unpack_row(s, store, row);
+            });
+        }
+        bits
+    };
     let active = match (pair(&h, CROP_TOP_LEFT), pair(&h, CROPPED_SIZE)) {
         (Some((top, left)), Some((ch, cw))) if ch > 0 && cw > 0 => Rect::new(left, top, cw, ch).clipped(w, hgt),
         _ => Rect::new(0, 0, w, hgt),
@@ -313,5 +336,32 @@ mod tests {
         // too little data for the size: compressed
         let bytes = raf(w, h, 14, vec![0; 20], None, b"");
         assert!(matches!(crate::decode(&bytes), Err(RawError::Unsupported(_))));
+    }
+
+    /// A lossless compressed strip decodes to its samples; one that doesn't decode (damaged, lossy) opens from the
+    /// embedded preview (`Unsupported`), as every compressed RAF did before the decoder existed.
+    #[test]
+    fn decodes_lossless_compressed_and_falls_back_to_the_preview_otherwise() {
+        use crate::vendor::rafc::tests::encode;
+        let (w, h) = (48u32, 12u32);
+        let layout: [u8; 36] = std::array::from_fn(|i| Cfa::xtrans().pattern[35 - i]);
+        // smooth, like a photo, so that it compresses well below the uncompressed size
+        let px: Vec<u16> = (0..48 * 12).map(|i| (1000 + (i % 48) * 20 + (i / 48) * 30 + (i * 7) % 5) as u16).collect();
+        let strip = encode(true, 14, 48, 12, 24, &px, &Cfa::xtrans(), 4);
+        assert!(strip.len() < 48 * 14 / 8 * 12, "the strip must be shorter than uncompressed data: {}", strip.len());
+        let bytes = raf(w, h, 14, strip.clone(), Some(layout), b"\xff\xd8\xff\xd9");
+        let r = crate::decode(&bytes).unwrap();
+        assert_eq!(r.data, RawData::U16(px));
+        assert_eq!((r.bits, r.cfa.as_ref()), (14, Some(&Cfa::xtrans())));
+        assert_eq!(crate::probe_info(&bytes).unwrap(), r.info());
+        let mut damaged = strip.clone();
+        let n = damaged.len();
+        damaged[n / 2..].fill(0);
+        assert!(matches!(crate::decode(&raf(w, h, 14, damaged, Some(layout), b"")), Err(RawError::Unsupported(_))));
+        let mut lossy = strip;
+        lossy[2] = 0;
+        let bytes = raf(w, h, 14, lossy, Some(layout), b"");
+        assert!(matches!(crate::decode(&bytes), Err(RawError::Unsupported(_))));
+        assert!(matches!(crate::probe_info(&bytes), Err(RawError::Unsupported(_))));
     }
 }
