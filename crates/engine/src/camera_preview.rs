@@ -1,6 +1,6 @@
-//! Estimate the starting look of a raw without a camera colour matrix (Sony ARW, Nikon NEF) from its
-//! own JPEG. Colour and luminance are fitted separately; the JPEG supplies correspondences only,
-//! never output pixels or a replacement for RAW editing.
+//! Estimate the starting look of a raw without a camera colour matrix (Sony ARW, Nikon NEF, Fujifilm
+//! RAF) from its own JPEG. Colour and luminance are fitted separately; the JPEG supplies
+//! correspondences only, never output pixels or a replacement for RAW editing.
 //! A global matrix can't follow the camera's hue-dependent rendering (the best matrix rendered a
 //! lime shirt olive that the camera kept lime): a hue/saturation table fitted to the residuals
 //! (applied like a DNG `ProfileHueSatMap`) corrects that when it also improves the held-out pixels.
@@ -31,7 +31,7 @@ pub(crate) const PROFILE_PROXY: usize = 192;
 /// as-shot look (`docs/camera-preview-colour.md`). The catalog's `Photo::relative_wb` matches the
 /// same formats by file extension.
 pub(crate) fn file_local_look(format: RawFormat) -> bool {
-    matches!(format, RawFormat::Arw | RawFormat::Nef | RawFormat::Nrw)
+    matches!(format, RawFormat::Arw | RawFormat::Nef | RawFormat::Nrw | RawFormat::Raf)
 }
 
 pub(crate) fn fit_preview(raw: &RawImage, bytes: &[u8], transform: &CameraTransform) -> Option<CameraLook> {
@@ -731,9 +731,116 @@ mod tests {
     }
 
     #[test]
-    fn sony_and_nikon_raws_get_a_file_local_look() {
-        assert!([RawFormat::Arw, RawFormat::Nef, RawFormat::Nrw].into_iter().all(file_local_look));
-        assert!(![RawFormat::Dng, RawFormat::Cr2, RawFormat::Raf].into_iter().any(file_local_look));
+    fn sony_nikon_and_fujifilm_raws_get_a_file_local_look() {
+        assert!([RawFormat::Arw, RawFormat::Nef, RawFormat::Nrw, RawFormat::Raf].into_iter().all(file_local_look));
+        assert!(![RawFormat::Dng, RawFormat::Cr2, RawFormat::Pef, RawFormat::Rw2].into_iter().any(file_local_look));
+    }
+
+    /// A minimal Fujifilm RAF (`crates/raw/src/vendor/raf.rs`): header, record directory (the
+    /// X-Trans layout, stored reversed, or none for a Bayer body) and a raw block holding a
+    /// little-endian TIFF whose `0xf000` IFD describes 14-bit samples in 16-bit words, black level
+    /// 256 and `WB_GRBLevels` 300/600/450 (R ×2, B ×1.5), with `jpeg` as the camera's preview.
+    fn synthetic_raf(w: usize, h: usize, samples: &[u16], cfa: &lightcraft_raw::Cfa, jpeg: &[u8]) -> Vec<u8> {
+        let (sub_off, n) = (26u32, 7u32);
+        let wb_off = sub_off + 2 + 12 * n + 4;
+        let strip_off = wb_off + 12;
+        let mut block = b"II*\0\x08\0\0\0\x01\0\x00\xf0\x0d\0\x01\0\0\0".to_vec();
+        block.extend_from_slice(&sub_off.to_le_bytes());
+        block.extend_from_slice(&0u32.to_le_bytes());
+        block.extend_from_slice(&(n as u16).to_le_bytes());
+        let entries = [
+            (0xf001u16, 1u32, w as u32),
+            (0xf002, 1, h as u32),
+            (0xf003, 1, 14),
+            (0xf007, 1, strip_off),
+            (0xf008, 1, (samples.len() * 2) as u32),
+            (0xf00a, 1, 256),
+            (0xf00e, 3, wb_off),
+        ];
+        for (tag, count, value) in entries {
+            block.extend_from_slice(&tag.to_le_bytes());
+            block.extend_from_slice(&4u16.to_le_bytes());
+            block.extend_from_slice(&count.to_le_bytes());
+            block.extend_from_slice(&value.to_le_bytes());
+        }
+        block.extend_from_slice(&0u32.to_le_bytes());
+        for level in [300u32, 600, 450] {
+            block.extend_from_slice(&level.to_le_bytes());
+        }
+        block.extend(samples.iter().flat_map(|v| v.to_le_bytes()));
+        let mut dir = Vec::new();
+        if cfa.width == 6 {
+            dir.extend_from_slice(&1u32.to_be_bytes());
+            dir.extend_from_slice(&[0x01, 0x31, 0, 36]);
+            dir.extend(cfa.pattern.iter().rev());
+        } else {
+            dir.extend_from_slice(&0u32.to_be_bytes());
+        }
+        let mut out = b"FUJIFILMCCD-RAW 0201FF000000TEST".to_vec();
+        out.resize(160, 0);
+        let offsets = [160, jpeg.len(), 160 + jpeg.len(), dir.len(), 160 + jpeg.len() + dir.len(), block.len()];
+        for (i, v) in offsets.into_iter().enumerate() {
+            out[84 + 4 * i..88 + 4 * i].copy_from_slice(&(v as u32).to_be_bytes());
+        }
+        out.extend_from_slice(jpeg);
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// Fujifilm RAFs (X-Trans and Bayer) get the same file-local look as ARW and NEF: a RAF whose
+    /// preview is a camera rendering of its own scene (more saturated, brighter tone curve) is
+    /// fitted, through the real decode → binned proxy → fit path; one whose preview shows another
+    /// scene keeps the fallback. White balance is relative to the as-shot look either way.
+    #[test]
+    fn fujifilm_raf_gets_a_camera_look_from_its_own_jpeg() {
+        let (w, h) = (960usize, 640usize);
+        // white-balanced camera RGB: 12 × 8 patches of different hue, saturation and brightness
+        let scene = |x: usize, y: usize| -> [f64; 3] {
+            let patch = (y * 8 / h) * 12 + x * 12 / w;
+            let along = (x % (w / 12)) as f64 / (w / 12) as f64;
+            let ev = 0.04 + 0.5 * ((patch * 5) % 9) as f64 / 8.0 * (0.6 + 0.4 * along);
+            let hue = ((patch * 37) % 96) as f64 / 96.0 * std::f64::consts::TAU;
+            let sat = 0.1 + 0.4 * ((patch * 11) % 7) as f64 / 6.0;
+            [0.0, 1.0, 2.0].map(|k| ev * (1.0 + sat * (hue - k * std::f64::consts::TAU / 3.0).cos()))
+        };
+        // the camera's JPEG: a saturation matrix and a brighter tone curve (linear sRGB), half size
+        let camera = Mat3([[1.3, -0.2, -0.1], [-0.1, 1.25, -0.15], [-0.05, -0.25, 1.3]]);
+        let jpeg_of = |shift: usize| {
+            let (jw, jh) = (w / 2, h / 2);
+            let mut rgb = Vec::with_capacity(jw * jh * 3);
+            for y in 0..jh {
+                for x in 0..jw {
+                    let p = camera.apply(scene((2 * x + shift) % w, 2 * y));
+                    let lum = (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]).max(1e-6);
+                    let o = 1.0 - (-3.0 * lum).exp();
+                    rgb.extend(p.map(|v| lightcraft_color::transfer::encode_srgb8((v * o / lum).clamp(0.0, 1.0) as f32)));
+                }
+            }
+            let img = lightcraft_codecs::EncodeImage::new(jw as u32, jh as u32, 3, lightcraft_codecs::Samples::U8(&rgb));
+            lightcraft_codecs::encode_jpeg(&img, 95, lightcraft_codecs::ChromaSubsampling::S444, &Default::default()).unwrap()
+        };
+        let (own, unrelated) = (jpeg_of(0), jpeg_of(w / 3));
+        let wb = [2.0, 1.0, 1.5];
+        for cfa in [Some(lightcraft_raw::Cfa::xtrans()), lightcraft_raw::Cfa::bayer("RGGB")].into_iter().flatten() {
+            let samples: Vec<u16> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let c = usize::from(cfa.color_at(x, y));
+                    (256.0 + scene(x, y)[c] / wb[c] * (16383.0 - 256.0)).round() as u16
+                })
+                .collect();
+            let bytes = synthetic_raf(w, h, &samples, &cfa, &own);
+            let raw = lightcraft_raw::decode(&bytes).unwrap();
+            assert_eq!((raw.format, raw.cfa.as_ref()), (RawFormat::Raf, Some(&cfa)));
+            let (img, info) = crate::files::load_bytes(&bytes, 400).unwrap();
+            assert!(img.width <= 400 && img.height > 0 && (img.width as f64 / img.height as f64 - 1.5).abs() < 0.01, "{}×{}", img.width, img.height);
+            assert!(info.camera_tone.is_some(), "{}: no camera look fitted", cfa.name());
+            assert!(info.relative_wb && info.as_shot_temp == 6500.0 && info.as_shot_tint == 0.0, "{}: {info:?}", cfa.name());
+            let (_, info) = crate::files::load_bytes(&synthetic_raf(w, h, &samples, &cfa, &unrelated), 400).unwrap();
+            assert!(info.camera_tone.is_none(), "{}: fitted to an unrelated preview", cfa.name());
+            assert!(info.relative_wb, "{}", cfa.name());
+        }
     }
 
     /// A public D7500 NEF (skipped without the corpus): its look is fitted to its own JPEG and white

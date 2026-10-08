@@ -336,11 +336,11 @@ impl Photo {
     pub fn develops_raw(&self) -> bool {
         self.kind == MediaKind::Raw && self.preview_only.is_none()
     }
-    /// The current ARW and NEF readers have vendor WB multipliers but no measured camera
+    /// The current ARW, NEF and RAF readers have vendor WB multipliers but no measured camera
     /// illuminant. Use adjustments relative to the camera's as-shot look, as for rendered
     /// photographs (the engine's `camera_preview::file_local_look` covers the same formats).
     pub fn relative_wb(&self) -> bool {
-        self.develops_raw() && ["ARW", "NEF", "NRW"].iter().any(|f| self.format.eq_ignore_ascii_case(f))
+        self.develops_raw() && ["ARW", "NEF", "NRW", "RAF"].iter().any(|f| self.format.eq_ignore_ascii_case(f))
     }
     /// The develop settings import gave this photo: [`Photo::camera_defaults`], or the user's
     /// default preset applied on top of them ([`Photo::import_look`]).
@@ -429,8 +429,15 @@ mod edited_tests {
     }
 
     #[test]
-    fn sony_and_nikon_raws_use_relative_white_balance() {
-        for (name, format, relative) in [("a.arw", "ARW", true), ("a.nef", "NEF", true), ("a.nrw", "nrw", true), ("a.dng", "DNG", false)] {
+    fn sony_nikon_and_fujifilm_raws_use_relative_white_balance() {
+        for (name, format, relative) in [
+            ("a.arw", "ARW", true),
+            ("a.nef", "NEF", true),
+            ("a.nrw", "nrw", true),
+            ("a.raf", "RAF", true),
+            ("a.dng", "DNG", false),
+            ("a.pef", "PEF", false),
+        ] {
             let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, name, format, 10, 10, "2026-10-01T00:00:00");
             p.kind = MediaKind::Raw;
             p.as_shot_wb = Some((5200.0, 4.0));
